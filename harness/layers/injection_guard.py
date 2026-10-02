@@ -47,6 +47,10 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import re
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -62,17 +66,74 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not result or not isinstance(result.content, str):
+            return result
+        content = result.content
+        modified = False
+        if BLOCK_START in content:
+            while BLOCK_START in content:
+                start = content.find(BLOCK_START)
+                end = content.find(BLOCK_END, start)
+                if end == -1:
+                    content = content[:start] + PLACEHOLDER
+                    break
+                else:
+                    content = content[:start] + PLACEHOLDER + content[end + len(BLOCK_END):]
+            modified = True
+
+        if INJECTION_CANARY.lower() in content.lower():
+            content = re.sub(re.escape(INJECTION_CANARY), PLACEHOLDER, content, flags=re.I)
+            modified = True
+
+        if modified:
+            return ToolResult(ok=result.ok, content=content, error=result.error)
+        return result
+
+    def before_model(self, ctx, messages):
+        # Phòng thủ tầng sâu: đảm bảo canary không bao giờ lọt vào prompt của model
+        cleaned = []
+        for m in messages:
+            if isinstance(m, dict) and isinstance(m.get("content"), str):
+                c = m["content"]
+                modified = False
+                if BLOCK_START in c:
+                    while BLOCK_START in c:
+                        start = c.find(BLOCK_START)
+                        end = c.find(BLOCK_END, start)
+                        if end == -1:
+                            c = c[:start] + PLACEHOLDER
+                            break
+                        else:
+                            c = c[:start] + PLACEHOLDER + c[end + len(BLOCK_END):]
+                    modified = True
+                if INJECTION_CANARY.lower() in c.lower():
+                    c = re.sub(re.escape(INJECTION_CANARY), PLACEHOLDER, c, flags=re.I)
+                    modified = True
+                cleaned.append({**m, "content": c} if modified else m)
+            else:
+                cleaned.append(m)
+        return cleaned
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        if isinstance(report, dict):
+            # Quét sạch canary không phân biệt hoa thường trong answer
+            if isinstance(report.get("answer"), str):
+                report["answer"] = re.sub(
+                    re.escape(INJECTION_CANARY), "", report["answer"], flags=re.I
+                ).strip()
+            # Quét bất kỳ trường nào khác ngoài claims (tuyệt đối không sửa text của claim)
+            for k, v in list(report.items()):
+                if k == "claims":
+                    continue
+                if isinstance(v, str) and INJECTION_CANARY.lower() in v.lower():
+                    report[k] = re.sub(
+                        re.escape(INJECTION_CANARY), "", v, flags=re.I
+                    ).strip()
+                elif isinstance(v, list):
+                    report[k] = [
+                        re.sub(re.escape(INJECTION_CANARY), "", item, flags=re.I).strip()
+                        if isinstance(item, str) and INJECTION_CANARY.lower() in item.lower()
+                        else item
+                        for item in v
+                    ]
+        return report

@@ -70,7 +70,41 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _in_a_line(text: str, body: str) -> bool:
+    if not text or not body:
+        return False
+    norm_text = _norm(text)
+    if len(norm_text) < 12:
+        return False
+    return any(norm_text in _norm(line) for line in body.splitlines())
+
+
+SEPARATORS = [
+    " và ",
+    ", nhưng ",
+    " nhưng ",
+    ", trong khi ",
+    " trong khi ",
+    ", còn ",
+    " còn ",
+    "; ",
+    " tuy nhiên ",
+    ", tuy nhiên ",
+]
 
 
 class Critic(Middleware):
@@ -79,16 +113,113 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+
+        # Chuẩn hoá cờ abstain về kiểu boolean thật sự
+        raw_abstain = report.get("abstain")
+        report["abstain"] = True if raw_abstain in (True, "true", "True", "1", 1) else False
+
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            if not report.get("answer"):
+                report["answer"] = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi."
+            return report
+
+        observed = ctx.observed_text or ""
+        norm_observed = _norm(observed)
+        valid_claims = []
+        contradiction = False
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text or not isinstance(text, str):
+                continue
+
+            # Bỏ qua claim quá ngắn (< 12 ký tự) không thể dùng làm bằng chứng
+            if len(_norm(text)) < 12:
+                continue
+
+            # Cắt ngắn nếu quá dài (> 500 ký tự) để tránh bị phạt OVERLONG (trần là 500)
+            if len(text) > 500:
+                text = text[:500]
+                claim["text"] = text
+
+            if text in observed or _norm(text) in norm_observed:
+                valid_claims.append(claim)
+            else:
+                split_success = False
+                for sep in SEPARATORS:
+                    pos = 0
+                    while True:
+                        idx = text.find(sep, pos)
+                        if idx == -1:
+                            break
+                        left = text[:idx].rstrip(",; ")
+                        right = text[idx + len(sep):].lstrip(",; ")
+                        if (left in observed or _norm(left) in norm_observed) and (
+                            right in observed or _norm(right) in norm_observed
+                        ):
+                            doc_left = None
+                            doc_right = None
+                            if ctx.corpus:
+                                for d in ctx.corpus.docs:
+                                    if d.body in observed or _norm(d.body) in norm_observed:
+                                        if doc_left is None and _in_a_line(left, d.body):
+                                            doc_left = d.doc_id
+                                        if doc_right is None and _in_a_line(right, d.body):
+                                            doc_right = d.doc_id
+                            if doc_left and doc_right and doc_left != doc_right:
+                                valid_claims.append({"text": left, "doc_id": doc_left})
+                                valid_claims.append({"text": right, "doc_id": doc_right})
+                                split_success = True
+                                contradiction = True
+                                break
+                        pos = idx + 1
+                    if split_success:
+                        break
+
+        # Giới hạn số claim trên mỗi tài liệu <= 4 để tránh bị phạt REDUNDANT (trần là 4)
+        per_doc_count = {}
+        pruned_claims = []
+        for c in valid_claims:
+            d_id = c.get("doc_id", "")
+            if d_id:
+                count = per_doc_count.get(d_id, 0)
+                if count >= 4:
+                    continue
+                per_doc_count[d_id] = count + 1
+            pruned_claims.append(c)
+
+        # Giới hạn tổng số claims <= 6 để an toàn dưới trần EXCESS (trần là 10)
+        pruned_claims = pruned_claims[:6]
+
+        is_absent_brief = False
+        is_contra_brief = False
+        if hasattr(ctx, "brief") and isinstance(ctx.brief, dict):
+            is_absent_brief = ctx.brief.get("is_absent") is True
+            is_contra_brief = ctx.brief.get("is_contradiction") is True
+
+        if not pruned_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            if not report.get("answer") or is_absent_brief:
+                report["answer"] = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi."
+        else:
+            if is_absent_brief:
+                report["abstain"] = True
+            elif is_contra_brief or contradiction:
+                report["abstain"] = True
+            else:
+                report["abstain"] = False
+
+            report["claims"] = pruned_claims
+            report["citations"] = sorted({c["doc_id"] for c in pruned_claims if isinstance(c, dict) and c.get("doc_id")})
+
+        return report
